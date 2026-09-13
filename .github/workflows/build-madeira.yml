@@ -2,192 +2,125 @@ name: Build Madeira IPA
 
 on:
   workflow_dispatch:
+  push:
+    branches: [codex/madeira-ipa-build]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: madeira-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: macos-15
-
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
     steps:
-      - name: Checkout Madeira
+      - name: Checkout pinned source and submodules
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0
-
-      - name: Show Xcode version
-        run: |
-          xcodebuild -version
-          xcode-select -p
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
-          brew update
-          brew install \
-            cmake \
-            ninja \
-            pkg-config \
-            autoconf \
-            automake \
-            libtool \
-            coreutils \
-            meson
+          brew install cmake ninja pkg-config autoconf automake libtool bison flex
+          xcodebuild -version
+          mkdir -p build/ci-logs
 
-      - name: Inspect repository
+      - name: Identify toolchain cache
+        id: cache-id
         run: |
-          echo "=== ROOT ==="
-          ls -la
+          version=$(xcodebuild -version | shasum -a 256 | cut -d ' ' -f 1)
+          echo "prefix=madeira-v1-${{ runner.arch }}-$version-" >> "$GITHUB_OUTPUT"
 
-          echo "=== BUILD ==="
-          find build -maxdepth 2 -type f -name "*.sh" -print | sort || true
+      - name: Restore dependency build cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            toolchains
+            research/freetype
+            FEX/build-ios
+            wine/build-macos
+            wine/build-arm64ec
+            build/freetype-ios/build
+            build/gnutls-ios/obj
+          key: ${{ steps.cache-id.outputs.prefix }}${{ github.sha }}
+          restore-keys: ${{ steps.cache-id.outputs.prefix }}
 
-          echo "=== APP ==="
-          find app -maxdepth 3 -type f \( \
-            -name "*.xcodeproj" -o \
-            -name "*.xcworkspace" -o \
-            -name "Package.swift" \
-          \) -print | sort || true
+      - name: Prepare cross-compilers and source dependencies
+        run: bash scripts/ci-build.sh prepare 2>&1 | tee build/ci-logs/prepare.log
 
-      - name: Make build scripts executable
-        run: |
-          find build scripts tools -type f -name "*.sh" -exec chmod +x {} \; 2>/dev/null || true
+      - name: Build FEX for iOS
+        run: bash scripts/ci-build.sh fex 2>&1 | tee build/ci-logs/fex.log
 
-      - name: Fetch Madeira LLVM-MinGW toolchain
-        shell: bash
-        run: |
-          set -euxo pipefail
+      - name: Generate Wine tools and headers
+        run: bash scripts/ci-build.sh wine-headers 2>&1 | tee build/ci-logs/wine-headers.log
 
-          VERSION="20260421"
-          NAME="llvm-mingw-${VERSION}-ucrt-macos-universal"
-          URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${VERSION}/${NAME}.tar.xz"
+      - name: Build native Wine and supporting libraries
+        run: bash scripts/ci-build.sh native 2>&1 | tee build/ci-logs/native.log
 
-          mkdir -p toolchains
+      - name: Build LLVM 15 for iOS
+        run: bash scripts/ci-build.sh llvm 2>&1 | tee build/ci-logs/llvm.log
 
-          echo "Downloading ${NAME}..."
+      - name: Build DXMT Metal and shader translation libraries
+        run: bash scripts/ci-build.sh dxmt 2>&1 | tee build/ci-logs/dxmt.log
 
-          curl -L --fail --retry 5 \
-            -o "toolchains/${NAME}.tar.xz" \
-            "$URL"
+      - name: Build and package unsigned IPA
+        run: bash scripts/ci-build.sh app 2>&1 | tee build/ci-logs/app.log
 
-          echo "Extracting toolchain..."
-
-          tar -xf "toolchains/${NAME}.tar.xz" \
-            -C toolchains
-
-          echo "Checking compiler..."
-
-          test -x "toolchains/${NAME}/bin/x86_64-w64-mingw32-clang"
-          test -x "toolchains/${NAME}/bin/aarch64-w64-mingw32-clang"
-
-          "toolchains/${NAME}/bin/x86_64-w64-mingw32-clang" --version
-
-      - name: Build native components
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          echo "Running Madeira build scripts..."
-
-          for script in build/*/build.sh; do
-            if [ -f "$script" ]; then
-              echo ""
-              echo "========================================"
-              echo "BUILDING: $script"
-              echo "========================================"
-              (
-                cd "$(dirname "$script")"
-                ./build.sh
-              )
-            fi
-          done
-
-      - name: Find Xcode project
-        id: xcode_project
-        shell: bash
-        run: |
-          set -e
-
-          PROJECT=$(find app -maxdepth 3 -name "*.xcodeproj" -print -quit)
-
-          if [ -z "$PROJECT" ]; then
-            echo "ERROR: No .xcodeproj found under app/"
-            exit 1
-          fi
-
-          echo "Found project: $PROJECT"
-          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
-
-      - name: List Xcode schemes
-        shell: bash
-        run: |
-          xcodebuild \
-            -project "${{ steps.xcode_project.outputs.project }}" \
-            -list
-
-      - name: Build iOS app
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          PROJECT="${{ steps.xcode_project.outputs.project }}"
-
-          xcodebuild \
-            -project "$PROJECT" \
-            -scheme Madeira \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination "generic/platform=iOS" \
-            -derivedDataPath "$PWD/build/DerivedData" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            build
-
-      - name: Locate Madeira.app
-        id: locate_app
-        shell: bash
-        run: |
-          set -e
-
-          APP=$(find build/DerivedData -type d -name "Madeira.app" -print -quit)
-
-          if [ -z "$APP" ]; then
-            echo "ERROR: Madeira.app was not found."
-            echo "Built applications:"
-            find build/DerivedData -type d -name "*.app" -print || true
-            exit 1
-          fi
-
-          echo "Found app: $APP"
-          echo "app=$APP" >> "$GITHUB_OUTPUT"
-
-      - name: Package unsigned IPA
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          APP="${{ steps.locate_app.outputs.app }}"
-
-          rm -rf Payload
-          mkdir -p Payload
-
-          cp -R "$APP" Payload/Madeira.app
-
-          /usr/bin/ditto -c -k --sequesterRsrc --keepParent \
-            Payload Madeira-unsigned.ipa
-
-      - name: Upload IPA
+      - name: Upload IPA and JIT script
         uses: actions/upload-artifact@v4
         with:
           name: Madeira-unsigned-IPA
-          path: Madeira-unsigned.ipa
+          path: |
+            build/ipa/Madeira-unsigned.ipa
+            app/Madeira/madeira-jit.js
           if-no-files-found: error
 
-      - name: Upload build logs
+      - name: Show captured compiler errors
+        if: failure()
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          files = sorted(set(Path('build').rglob('*.err')) | set(Path('build').rglob('err-*.txt')))
+          files += list(Path('build/gnutls-ios/obj').glob('*-configure.log'))
+          for path in [p for p in files if p.stat().st_size][-30:]:
+              print(f'\n{path}:')
+              print('\n'.join(path.read_text(errors='replace').splitlines()[-100:]))
+          PY
+
+      - name: Save dependency build cache
+        if: always() && !cancelled() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            toolchains
+            research/freetype
+            FEX/build-ios
+            wine/build-macos
+            wine/build-arm64ec
+            build/freetype-ios/build
+            build/gnutls-ios/obj
+          key: ${{ steps.cache-id.outputs.prefix }}${{ github.sha }}
+
+      - name: Upload build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Madeira-build-logs
           path: |
+            build/ci-logs
+            build/**/*.err
+            build/**/err-*.txt
             build/**/*.log
-            build/DerivedData/Logs/**
+            wine/build-macos/config.log
+            FEX/build-ios/CMakeFiles/CMakeConfigureLog.yaml
+            toolchains/llvm-*-build/CMakeFiles/CMakeConfigureLog.yaml
+            build/DerivedData/Logs
           if-no-files-found: ignore
