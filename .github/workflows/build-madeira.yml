@@ -51,6 +51,35 @@ jobs:
         run: |
           find build scripts tools -type f -name "*.sh" -exec chmod +x {} \; 2>/dev/null || true
 
+      - name: Fetch Madeira LLVM-MinGW toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          VERSION="20260421"
+          NAME="llvm-mingw-${VERSION}-ucrt-macos-universal"
+          URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${VERSION}/${NAME}.tar.xz"
+
+          mkdir -p toolchains
+
+          echo "Downloading ${NAME}..."
+
+          curl -L --fail --retry 5 \
+            -o "toolchains/${NAME}.tar.xz" \
+            "$URL"
+
+          echo "Extracting toolchain..."
+
+          tar -xf "toolchains/${NAME}.tar.xz" \
+            -C toolchains
+
+          echo "Checking compiler..."
+
+          test -x "toolchains/${NAME}/bin/x86_64-w64-mingw32-clang"
+          test -x "toolchains/${NAME}/bin/aarch64-w64-mingw32-clang"
+
+          "toolchains/${NAME}/bin/x86_64-w64-mingw32-clang" --version
+
       - name: Build native components
         shell: bash
         run: |
