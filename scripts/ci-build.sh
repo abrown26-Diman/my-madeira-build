@@ -42,10 +42,32 @@ PY
     "$MINGW/aarch64-w64-mingw32-clang" --version
     ;;
   fex)
+    # The Madeira FEX fork contains a pair of ARM64EC/Windows-only telemetry
+    # reporters in Core.cpp that are not guarded from the native iOS FEXCore
+    # build. Their backing arrays live in Source/Windows/ARM64EC/Module.cpp, so
+    # compiling those reporters into the Mach/iOS library is both unnecessary
+    # and invalid. Keep them enabled for the ARM64EC build, but exclude them
+    # from this native iOS target.
+    python3 - <<'PY'
+from pathlib import Path
+p = Path('FEX/FEXCore/Source/Interface/Core/Core.cpp')
+text = p.read_text()
+start = '  /* iOS-Madeira ml304 (task #51): REPORT CallbackPtr ENTRY ON ITS OWN, not via the bogus-RIP path.'
+end = '  /* iOS-Madeira: refuse to compile obviously-invalid guest RIPs.'
+if '#if defined(FEX_IOS_HOST) && defined(_WIN32)\n' + start not in text:
+    if start not in text or end not in text:
+        raise SystemExit('Could not locate Madeira ARM64EC telemetry block in Core.cpp')
+    text = text.replace(start, '#if defined(FEX_IOS_HOST) && defined(_WIN32)\n' + start, 1)
+    text = text.replace(end, '#endif\n\n' + end, 1)
+    p.write_text(text)
+PY
     cmake -S FEX -B FEX/build-ios -G Ninja \
       -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_SYSTEM_PROCESSOR=arm64 \
       -DCMAKE_OSX_SYSROOT="$IOS_SDK" -DCMAKE_OSX_ARCHITECTURES=arm64 \
       -DCMAKE_OSX_DEPLOYMENT_TARGET=18.0 -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_FLAGS="-DFEX_IOS_HOST=1" \
+      -DCMAKE_CXX_FLAGS="-DFEX_IOS_HOST=1" \
+      -DCMAKE_ASM_FLAGS="-DFEX_IOS_HOST=1" \
       -DTUNE_CPU=none -DTUNE_ARCH=generic \
       -DBUILD_TESTING=OFF -DBUILD_FEXCONFIG=OFF -DBUILD_THUNKS=OFF \
       -DENABLE_LTO=OFF -DENABLE_CCACHE=OFF -DENABLE_GDB_SYMBOLS=OFF
