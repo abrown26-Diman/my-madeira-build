@@ -180,6 +180,73 @@ PY
     ;;
   app)
     bash tools/check-prefix-template.sh
+    # The source uses iOS 26 SwiftUI Liquid Glass APIs. GitHub's current
+    # macos-15 image here has Xcode 16.4 / iOS 18.5 SDK, so runtime
+    # #available checks alone are insufficient: the old compiler cannot resolve
+    # glassEffect at all. Wrap those paths in compiler checks so Xcode 16.4
+    # builds the existing ultraThinMaterial fallback, while Xcode 26+ keeps the
+    # Liquid Glass implementation.
+    python3 - <<'PY'
+from pathlib import Path
+p = Path('app/Madeira/ContentView.swift')
+text = p.read_text()
+old1 = '''    @ViewBuilder private var interior: some View {
+        if #available(iOS 26.0, *) {
+            Circle().fill(.clear).glassEffect(.regular, in: Circle())
+        } else {
+            Circle().fill(.ultraThinMaterial)
+        }
+    }
+'''
+new1 = '''    @ViewBuilder private var interior: some View {
+#if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            Circle().fill(.clear).glassEffect(.regular, in: Circle())
+        } else {
+            Circle().fill(.ultraThinMaterial)
+        }
+#else
+        Circle().fill(.ultraThinMaterial)
+#endif
+    }
+'''
+old2 = '''    var body: some View {
+        if #available(iOS 26.0, *) {
+            if circle { Circle().fill(.clear).glassEffect(.regular, in: Circle()) }
+            else { RoundedRectangle(cornerRadius: 18).fill(.clear)
+                     .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18)) }
+        } else {
+            if circle { Circle().fill(.ultraThinMaterial) }
+            else { RoundedRectangle(cornerRadius: 18).fill(.ultraThinMaterial) }
+        }
+    }
+'''
+new2 = '''    var body: some View {
+#if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            if circle { Circle().fill(.clear).glassEffect(.regular, in: Circle()) }
+            else { RoundedRectangle(cornerRadius: 18).fill(.clear)
+                     .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18)) }
+        } else {
+            if circle { Circle().fill(.ultraThinMaterial) }
+            else { RoundedRectangle(cornerRadius: 18).fill(.ultraThinMaterial) }
+        }
+#else
+        if circle { Circle().fill(.ultraThinMaterial) }
+        else { RoundedRectangle(cornerRadius: 18).fill(.ultraThinMaterial) }
+#endif
+    }
+'''
+if old1 in text:
+    text = text.replace(old1, new1, 1)
+elif new1 not in text:
+    raise SystemExit('Could not locate JoystickFace glassEffect block')
+if old2 in text:
+    text = text.replace(old2, new2, 1)
+elif new2 not in text:
+    raise SystemExit('Could not locate GlassShape glassEffect block')
+p.write_text(text)
+PY
     # Microsoft runtimes are supplied by the device owner; keep the resource
     # directory present without adding unrequested third-party binaries.
     mkdir -p app/Madeira/x86_64-vcruntime
