@@ -42,14 +42,14 @@ PY
     "$MINGW/aarch64-w64-mingw32-clang" --version
     ;;
   fex)
-    # The Madeira FEX fork contains a pair of ARM64EC/Windows-only telemetry
-    # reporters in Core.cpp that are not guarded from the native iOS FEXCore
-    # build. Their backing arrays live in Source/Windows/ARM64EC/Module.cpp, so
-    # compiling those reporters into the Mach/iOS library is both unnecessary
-    # and invalid. Keep them enabled for the ARM64EC build, but exclude them
-    # from this native iOS target.
+    # The Madeira FEX fork contains a few ARM64EC/Windows-only diagnostics in
+    # files that are also compiled into the native iOS FEXCore library. Patch
+    # those diagnostics out only for this native build while keeping the real
+    # iOS host code paths enabled via FEX_IOS_HOST.
     python3 - <<'PY'
 from pathlib import Path
+
+# Core.cpp: ARM64EC telemetry arrays are defined only in the Windows frontend.
 p = Path('FEX/FEXCore/Source/Interface/Core/Core.cpp')
 text = p.read_text()
 start = '  /* iOS-Madeira ml304 (task #51): REPORT CallbackPtr ENTRY ON ITS OWN, not via the bogus-RIP path.'
@@ -60,6 +60,45 @@ if '#if defined(FEX_IOS_HOST) && defined(_WIN32)\n' + start not in text:
     text = text.replace(start, '#if defined(FEX_IOS_HOST) && defined(_WIN32)\n' + start, 1)
     text = text.replace(end, '#endif\n\n' + end, 1)
     p.write_text(text)
+
+# Arm64.cpp: the CASPAL diagnostic uses Win32 VirtualQuery even when building
+# the Mach/iOS host library. Keep that richer probe on Windows; on iOS log the
+# address/misalignment without Win32 MEMORY_BASIC_INFORMATION.
+p = Path('FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp')
+text = p.read_text()
+old = '''  MEMORY_BASIC_INFORMATION mbi {};
+  const char* type = "?";
+  if (VirtualQuery(reinterpret_cast<LPCVOID>(GPRs[AddressReg]), &mbi, sizeof(mbi))) {
+    type = mbi.Type == MEM_IMAGE ? "MEM_IMAGE" : mbi.Type == MEM_MAPPED ? "MEM_MAPPED" : "MEM_PRIVATE";
+  }
+  LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} "
+                    "crosses16B={} | region base={} size={:#x} prot={:#x} type={} state={:#x}",
+                    Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
+                    (GPRs[AddressReg] & 15) ? "yes" : "no", mbi.BaseAddress, mbi.RegionSize,
+                    mbi.Protect, type, mbi.State);
+'''
+new = '''#if defined(_WIN32)
+  MEMORY_BASIC_INFORMATION mbi {};
+  const char* type = "?";
+  if (VirtualQuery(reinterpret_cast<LPCVOID>(GPRs[AddressReg]), &mbi, sizeof(mbi))) {
+    type = mbi.Type == MEM_IMAGE ? "MEM_IMAGE" : mbi.Type == MEM_MAPPED ? "MEM_MAPPED" : "MEM_PRIVATE";
+  }
+  LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} "
+                    "crosses16B={} | region base={} size={:#x} prot={:#x} type={} state={:#x}",
+                    Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
+                    (GPRs[AddressReg] & 15) ? "yes" : "no", mbi.BaseAddress, mbi.RegionSize,
+                    mbi.Protect, type, mbi.State);
+#else
+  LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} crosses16B={} (iOS host)",
+                    Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
+                    (GPRs[AddressReg] & 15) ? "yes" : "no");
+#endif
+'''
+if old in text:
+    text = text.replace(old, new, 1)
+elif new not in text:
+    raise SystemExit('Could not locate Win32 VirtualQuery CASPAL diagnostic in Arm64.cpp')
+p.write_text(text)
 PY
     cmake -S FEX -B FEX/build-ios -G Ninja \
       -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_SYSTEM_PROCESSOR=arm64 \
