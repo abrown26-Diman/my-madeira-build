@@ -1,0 +1,164 @@
+name: Build Madeira IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout Madeira
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Install build dependencies
+        run: |
+          brew update
+          brew install \
+            cmake \
+            ninja \
+            pkg-config \
+            autoconf \
+            automake \
+            libtool \
+            coreutils \
+            meson
+
+      - name: Inspect repository
+        run: |
+          echo "=== ROOT ==="
+          ls -la
+
+          echo "=== BUILD ==="
+          find build -maxdepth 2 -type f -name "*.sh" -print | sort || true
+
+          echo "=== APP ==="
+          find app -maxdepth 3 -type f \( \
+            -name "*.xcodeproj" -o \
+            -name "*.xcworkspace" -o \
+            -name "Package.swift" \
+          \) -print | sort || true
+
+      - name: Make build scripts executable
+        run: |
+          find build scripts tools -type f -name "*.sh" -exec chmod +x {} \; 2>/dev/null || true
+
+      - name: Build native components
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Running Madeira build scripts..."
+
+          for script in build/*/build.sh; do
+            if [ -f "$script" ]; then
+              echo ""
+              echo "========================================"
+              echo "BUILDING: $script"
+              echo "========================================"
+              (
+                cd "$(dirname "$script")"
+                ./build.sh
+              )
+            fi
+          done
+
+      - name: Find Xcode project
+        id: xcode_project
+        shell: bash
+        run: |
+          set -e
+
+          PROJECT=$(find app -maxdepth 3 -name "*.xcodeproj" -print -quit)
+
+          if [ -z "$PROJECT" ]; then
+            echo "ERROR: No .xcodeproj found under app/"
+            exit 1
+          fi
+
+          echo "Found project: $PROJECT"
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+
+      - name: List Xcode schemes
+        shell: bash
+        run: |
+          xcodebuild \
+            -project "${{ steps.xcode_project.outputs.project }}" \
+            -list
+
+      - name: Build iOS app
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          PROJECT="${{ steps.xcode_project.outputs.project }}"
+
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme Madeira \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$PWD/build/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Locate Madeira.app
+        id: locate_app
+        shell: bash
+        run: |
+          set -e
+
+          APP=$(find build/DerivedData -type d -name "Madeira.app" -print -quit)
+
+          if [ -z "$APP" ]; then
+            echo "ERROR: Madeira.app was not found."
+            echo "Built applications:"
+            find build/DerivedData -type d -name "*.app" -print || true
+            exit 1
+          fi
+
+          echo "Found app: $APP"
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          APP="${{ steps.locate_app.outputs.app }}"
+
+          rm -rf Payload
+          mkdir -p Payload
+
+          cp -R "$APP" Payload/Madeira.app
+
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent \
+            Payload Madeira-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-unsigned-IPA
+          path: Madeira-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-build-logs
+          path: |
+            build/**/*.log
+            build/DerivedData/Logs/**
+          if-no-files-found: ignore
