@@ -1,0 +1,140 @@
+name: Build Persona 3 Reload Madeira Test IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout patch source
+        uses: actions/checkout@v4
+        with:
+          path: patch-source
+
+      - name: Checkout current Madeira baseline
+        uses: actions/checkout@v4
+        with:
+          repository: willfaust/Madeira
+          ref: bbbf8d0e20fd8b75f433f4a8d2a8eaf8d5571120
+          submodules: recursive
+          fetch-depth: 0
+          path: Madeira
+
+      - name: Apply Persona 3 launch-option patches
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd Madeira
+          git apply ../patch-source/patches/persona3-launch-option-app.patch
+          cd madeira-dock
+          git apply ../../patch-source/patches/persona3-launch-option-dock.patch
+          cd ..
+          echo "=== Superproject diff ==="
+          git diff --check
+          git diff -- app/Madeira/SwiftSteam/Library/SteamAppInfo.swift app/Madeira/SteamGames.swift app/Madeira/SteamOwnedLibrary.swift app/Madeira/MadeiraDock.swift app/Madeira/ContentView.swift tests/host/check-steam-games.py
+          echo "=== Dock diff ==="
+          git -C madeira-dock diff --check
+          git -C madeira-dock diff -- src/launch.c
+
+      - name: Run host regression checks
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd Madeira
+          python3 tests/host/check-steam-games.py
+          python3 tests/host/check-dock-contract.py
+
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Install build dependencies
+        run: |
+          brew update
+          brew install cmake ninja pkg-config autoconf automake libtool coreutils meson
+
+      - name: Fetch Madeira LLVM-MinGW toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd Madeira
+          VERSION="20260421"
+          NAME="llvm-mingw-${VERSION}-ucrt-macos-universal"
+          URL="https://github.com/mstorsjo/llvm-mingw/releases/download/${VERSION}/${NAME}.tar.xz"
+          mkdir -p toolchains
+          curl -L --fail --retry 5 -o "toolchains/${NAME}.tar.xz" "$URL"
+          tar -xf "toolchains/${NAME}.tar.xz" -C toolchains
+          test -x "toolchains/${NAME}/bin/x86_64-w64-mingw32-clang"
+          test -x "toolchains/${NAME}/bin/aarch64-w64-mingw32-clang"
+
+      - name: Make build scripts executable
+        shell: bash
+        run: |
+          cd Madeira
+          find build tools -type f -name "*.sh" -exec chmod +x {} \; 2>/dev/null || true
+
+      - name: Build native components
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd Madeira
+          for script in build/*/build.sh; do
+            if [ -f "$script" ]; then
+              echo "========================================"
+              echo "BUILDING: $script"
+              echo "========================================"
+              (cd "$(dirname "$script")" && ./build.sh)
+            fi
+          done
+
+      - name: Build iOS app
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd Madeira
+          PROJECT=$(find app -maxdepth 3 -name "*.xcodeproj" -print -quit)
+          test -n "$PROJECT"
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme Madeira \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$PWD/build/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd Madeira
+          APP=$(find build/DerivedData -type d -name "Madeira.app" -print -quit)
+          test -n "$APP"
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP" Payload/Madeira.app
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent Payload Madeira-P3R-launch-option-test-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-P3R-launch-option-test-unsigned
+          path: Madeira/Madeira-P3R-launch-option-test-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload patch/build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-P3R-test-build-logs
+          path: |
+            Madeira/build/**/*.log
+            Madeira/build/DerivedData/Logs/**
+          if-no-files-found: ignore
