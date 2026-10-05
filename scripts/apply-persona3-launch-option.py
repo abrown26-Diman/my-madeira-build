@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+# GitHub Actions checks out this repo as patch-source/ and Madeira as its sibling.
+# Run from the workflow workspace root so the target stays unambiguous.
+ROOT = Path.cwd()
 MADEIRA = ROOT / "Madeira"
+if not MADEIRA.is_dir():
+    raise SystemExit(f"Madeira checkout not found at {MADEIRA}")
 
 def replace_once(path, old, new):
     p = MADEIRA / path
