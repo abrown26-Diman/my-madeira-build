@@ -1,0 +1,144 @@
+diff --git a/app/Madeira/SwiftSteam/Library/SteamAppInfo.swift b/app/Madeira/SwiftSteam/Library/SteamAppInfo.swift
+--- a/app/Madeira/SwiftSteam/Library/SteamAppInfo.swift
++++ b/app/Madeira/SwiftSteam/Library/SteamAppInfo.swift
+@@ -197,6 +197,9 @@ struct SteamLaunchOption: Codable, Hashable, Sendable {
+     var oslist = ""
+     var osarch = ""
+     var betaKey = ""
++    /// Numeric config.launch key Valve's client expects in LaunchApp.
++    /// Optional so launch options cached by older Madeira builds still decode.
++    var index: Int? = nil
+ 
+     /// Entries in Steam's order (numeric keys), without those that name no
+     /// program or carry oversized text; at most 32.
+@@ -204,7 +207,7 @@ struct SteamLaunchOption: Codable, Hashable, Sendable {
+         let keys = launch.keys.compactMap { key in Int(key).map { ($0, key) } }.sorted { $0.0 < $1.0 }
+         var options: [SteamLaunchOption] = []
+-        for (_, key) in keys.prefix(32) {
++        for (numericKey, key) in keys.prefix(32) {
+             guard let entry = launch[key] as? [String: Any], let executable = entry["executable"] as? String,
+                   !executable.isEmpty, executable.utf8.count <= 512 else { continue }
+             func text(_ value: Any?, limit: Int = 256) -> String? {
+@@ -217,7 +220,8 @@ struct SteamLaunchOption: Codable, Hashable, Sendable {
+                   let type = text(entry["type"]), let oslist = text(config["oslist"]), let osarch = text(config["osarch"]),
+                   let betaKey = text(config["betakey"]) else { continue }
+             options.append(SteamLaunchOption(executable: executable, arguments: arguments, workingDir: workingDir,
+-                                             type: type, oslist: oslist, osarch: osarch, betaKey: betaKey))
++                                             type: type, oslist: oslist, osarch: osarch, betaKey: betaKey,
++                                             index: numericKey))
+         }
+         return options
+     }
+diff --git a/app/Madeira/SteamGames.swift b/app/Madeira/SteamGames.swift
+--- a/app/Madeira/SteamGames.swift
++++ b/app/Madeira/SteamGames.swift
+@@ -177,6 +177,9 @@ enum SteamDirectStart {
+         var program: String
+         var arguments: String
+         var folder: String?
++        /// Steam config.launch key for this exact program, when it came from
++        /// product info. Madeira Dock passes this to Valve's LaunchApp.
++        var launchIndex: Int? = nil
+     }
+@@ -248,7 +251,8 @@ enum SteamDirectStart {
+                     folder = found
+                 }
+             }
+-            return Choice(program: program, arguments: option.arguments.trimmingCharacters(in: spaces), folder: folder)
++            return Choice(program: program, arguments: option.arguments.trimmingCharacters(in: spaces),
++                          folder: folder, launchIndex: option.index)
+         }
+         return nil
+     }
+diff --git a/app/Madeira/SteamOwnedLibrary.swift b/app/Madeira/SteamOwnedLibrary.swift
+--- a/app/Madeira/SteamOwnedLibrary.swift
++++ b/app/Madeira/SteamOwnedLibrary.swift
+@@ -201,7 +201,10 @@ final class SteamOwnedLibrary: ObservableObject {
+     /// app's own connection (signed in, no session running) and kept in the cache.
+     /// nil when it cannot be had; the Program picker then decides.
+     func launchOptions(appID: Int) async -> [SteamLaunchOption]? {
+-        if let cached = game(appID)?.launches { return cached }
++        // Older cache files have launch entries but not their numeric config.launch
++        // keys. Refresh those once so Dock can pass the real launch option to Steam.
++        if let cached = game(appID)?.launches,
++           cached.isEmpty || cached.allSatisfy({ $0.index != nil }) { return cached }
+         guard Self.enabled, signedIn, !inSession, appID > 0, appID <= Int(UInt32.max) else { return nil }
+         do {
+             guard let info = try await fetcher.fetchAppInfo(appID: UInt32(appID)) else { return nil }
+diff --git a/app/Madeira/MadeiraDock.swift b/app/Madeira/MadeiraDock.swift
+--- a/app/Madeira/MadeiraDock.swift
++++ b/app/Madeira/MadeiraDock.swift
+@@ -362,7 +362,7 @@ enum MadeiraDock {
+     }
+ 
+     /// The host's environment for one launch.
+-    static func configure(_ game: DockGame) {
++    static func configure(_ game: DockGame, launchOption: Int? = nil) {
+         for key in ["MADEIRA_STEAM_HOST_PROBE", "MADEIRA_STEAM_HOST_SESSION", "MADEIRA_STEAM_HOST_LOGIN", "MADEIRA_STEAM_HOST_LAUNCH"] {
+             setenv(key, "1", 1)
+         }
+@@ -371,6 +371,15 @@ enum MadeiraDock {
+         setenv("MADEIRA_STEAM_HOST_CLIENT_DIR", SteamRuntimeFiles.windowsRoot, 1)
+         setenv("MADEIRA_STEAM_HOST_EXPECTED_INSTALL", game.windowsInstallPath, 1)
+         setenv("MADEIRA_STEAM_HOST_LOG", "C:\\madeira-dock.txt", 1)
++        // LaunchApp's third argument is the numeric config.launch key, not an
++        // array offset. Most games have key 0; some (Persona 3 Reload among them)
++        // start at 1. Unset keeps Dock's historical option-0 fallback.
++        if let launchOption, launchOption >= 0, UInt64(launchOption) <= UInt64(UInt32.max) {
++            setenv("MADEIRA_STEAM_HOST_LAUNCH_OPTION", String(launchOption), 1)
++            SteamLog.event("[dock-launch] launch-option=\(launchOption)")
++        } else {
++            unsetenv("MADEIRA_STEAM_HOST_LAUNCH_OPTION")
++        }
+         // The install record lists per-user executables: Dock asks Valve's client to prepare
+         // them before it launches. env.MADEIRA_DOCK_CEG = 0 never asks.
+diff --git a/app/Madeira/ContentView.swift b/app/Madeira/ContentView.swift
+--- a/app/Madeira/ContentView.swift
++++ b/app/Madeira/ContentView.swift
+@@ -3512,6 +3512,17 @@ struct ContentView: View {
+         // (SteamOwnedLibrary.prepareDock / dockEnded, SteamConnectionGate).
+         Task { @MainActor in
++            // Resolve the same Windows/default launch entry used by
++            // "Start with: The game" while the app's Steam connection is still
++            // available. Dock later passes its numeric config.launch key to Valve.
++            // If metadata is unavailable, nil preserves the historical option-0
++            // behaviour rather than blocking a game that used to launch.
++            let launchOptions = await SteamOwnedLibrary.shared.launchOptions(appID: game.id)
++            let installRoot = MadeiraDock.drive
++                .appendingPathComponent(game.library, isDirectory: true)
++                .appendingPathComponent("common", isDirectory: true)
++                .appendingPathComponent(game.installDir, isDirectory: true)
++            let launchOption = launchOptions.flatMap {
++                SteamDirectStart.choose($0, installFolder: installRoot)?.launchIndex
++            }
+             await SteamOwnedLibrary.shared.prepareDock()
+             do {
+                 // The launch state may have changed while the connection closed.
+@@ -3528,7 +3539,7 @@ struct ContentView: View {
+                 try MadeiraDock.writeHandoff(account: signIn.accountName, token: signIn.refreshToken, appID: game.id)
+             } catch { fail(error); return }
+-            MadeiraDock.configure(game)
++            MadeiraDock.configure(game, launchOption: launchOption)
+             // The game's one-time installs (its Steam install script) run first, in the same
+             // session. No session runs yet, so the registry files can be read and written.
+             DockInstallers.prepare(game, drive: MadeiraDock.drive, prefix: MadeiraDock.prefix)
+diff --git a/tests/host/check-steam-games.py b/tests/host/check-steam-games.py
+--- a/tests/host/check-steam-games.py
++++ b/tests/host/check-steam-games.py
+@@ -700,6 +700,9 @@ checks = r'''
+         require(directInfo.launches.map(\.executable) == ["bin32\\game.exe", "server/srv.exe", "Direct.app", "Bin64\\\\Game.exe",
+                                                           "beta/game.exe", "..\\escape.exe", "tools/launcher.exe", "tools/launcher.exe"],
+                 "config.launch is read in Steam's numeric order, without entries that name no program: \(directInfo.launches.map(\.executable))")
++        require(directInfo.launches.compactMap(\.index) == [0, 1, 2, 3, 4, 5, 6, 7],
++                "config.launch keeps Valve's numeric keys for LaunchApp: \(directInfo.launches.compactMap(\.index))")
+         require(directInfo.launches[1].type == "server" && directInfo.launches[4].betaKey == "public-beta" &&
+                 directInfo.launches[2].oslist == "macos" && directInfo.launches[3].osarch == "64",
+                 "each entry keeps its type, platform, architecture and beta branch")
+@@ -727,8 +730,9 @@ checks = r'''
+         try fm.createSymbolicLink(at: install.appendingPathComponent("loop"), withDestinationURL: install)
+         let options = directInfo.launches
+-        require(D.choose(options, installFolder: install) == D.Choice(program: "bin64/game.exe", arguments: "-dx11 -skipintro", folder: nil),
+-                "Steam's 64-bit default entry, found without case, with its arguments: \(String(describing: D.choose(options, installFolder: install)))")
++        require(D.choose(options, installFolder: install) == D.Choice(program: "bin64/game.exe", arguments: "-dx11 -skipintro",
++                                                                       folder: nil, launchIndex: 3),
++                "Steam's 64-bit default entry keeps launch key 3: \(String(describing: D.choose(options, installFolder: install)))")
