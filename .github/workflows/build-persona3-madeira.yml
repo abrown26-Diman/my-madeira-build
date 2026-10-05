@@ -19,22 +19,26 @@ jobs:
         with:
           repository: willfaust/Madeira
           ref: bbbf8d0e20fd8b75f433f4a8d2a8eaf8d5571120
-          submodules: recursive
+          submodules: false
           fetch-depth: 0
           path: Madeira
+
+      - name: Fetch Madeira Dock submodule
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd Madeira
+          git submodule update --init madeira-dock
 
       - name: Apply Persona 3 launch-option patches
         shell: bash
         run: |
           set -euxo pipefail
+          python3 patch-source/scripts/apply-persona3-launch-option.py
           cd Madeira
-          git apply ../patch-source/patches/persona3-launch-option-app.patch
-          cd madeira-dock
-          git apply ../../patch-source/patches/persona3-launch-option-dock.patch
-          cd ..
           echo "=== Superproject diff ==="
           git diff --check
-          git diff -- app/Madeira/SwiftSteam/Library/SteamAppInfo.swift app/Madeira/SteamGames.swift app/Madeira/SteamOwnedLibrary.swift app/Madeira/MadeiraDock.swift app/Madeira/ContentView.swift tests/host/check-steam-games.py
+          git diff -- app/Madeira/SwiftSteam/Library/SteamAppInfo.swift app/Madeira/SteamGames.swift app/Madeira/SteamOwnedLibrary.swift app/Madeira/MadeiraDock.swift app/Madeira/ContentView.swift
           echo "=== Dock diff ==="
           git -C madeira-dock diff --check
           git -C madeira-dock diff -- src/launch.c
@@ -46,6 +50,13 @@ jobs:
           cd Madeira
           python3 tests/host/check-steam-games.py
           python3 tests/host/check-dock-contract.py
+
+      - name: Fetch remaining submodules
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd Madeira
+          git submodule update --init --recursive
 
       - name: Show Xcode version
         run: |
