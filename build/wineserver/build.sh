@@ -12,14 +12,18 @@ SHIMS_DIR="$REPO_ROOT/build/ntdll-unix/shims"
 OBJ_DIR="$BUILD_DIR/obj"
 mkdir -p "$OBJ_DIR"
 
-# Copy the base library if we don't have one yet
+# A checkout does not include a base archive. Bootstrap its unpatched
+# objects from Wine's source manifest instead of depending on a local binary.
+FULL_REBUILD=0
 if [ ! -f "$OBJ_DIR/libwineserver.a" ]; then
     if [ -f "$APP_LIB" ]; then
         cp "$APP_LIB" "$OBJ_DIR/libwineserver.a"
     else
-        echo "ERROR: No base libwineserver.a found"
-        exit 1
+        FULL_REBUILD=1
     fi
+fi
+if [ "${MADEIRA_CLEAN_WINESERVER:-0}" = 1 ]; then
+    FULL_REBUILD=1
 fi
 
 CC_FLAGS=(
@@ -131,6 +135,38 @@ case "${1:-all}" in
         exit 1
         ;;
 esac
+
+if [ "$FULL_REBUILD" = 1 ]; then
+    if [ "${1:-all}" != all ]; then
+        echo "A clean Wine server build requires the 'all' target." >&2
+        exit 1
+    fi
+    echo "=== Building the remaining Wine server sources ==="
+    BASE_OBJECTS=("$OBJ_DIR/wineserver_ios_kill.o")
+    while IFS= read -r src; do
+        name=$(basename "$src" .c)
+        patched=0
+        for entry in "${PATCHED_FILES[@]}"; do
+            if [ "${entry##*:}" = "$name.o" ]; then patched=1; break; fi
+        done
+        [ "$patched" = 1 ] && continue
+        compile_one "$WINE_SRC/server/$src" "$name"
+        BASE_OBJECTS+=("$OBJ_DIR/$name.o")
+    done < <(python3 - "$WINE_SRC/server/Makefile.in" <<'PY'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text().replace("\\\n", " ")
+match = re.search(r"^SOURCES\s*=([^\n]*)", text, re.MULTILINE)
+if not match:
+    raise SystemExit("Cannot find Wine server SOURCES")
+for source in match.group(1).split():
+    if source.endswith(".c"):
+        print(source)
+PY
+    )
+    # Always create a new archive; never retain obsolete objects from a cache.
+    rm -f "$OBJ_DIR/libwineserver.a"
+    ar rcs "$OBJ_DIR/libwineserver.a" "${BASE_OBJECTS[@]}"
+fi
 
 echo ""
 echo "=== Updating libwineserver.a ==="
